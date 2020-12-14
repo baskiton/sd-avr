@@ -1,0 +1,12 @@
+/.idea/
+/.pio/
+/.vscode/
+/cmake-build-*/
+/lib/
+
+!.gitattributes
+!.gitignore
+
+/platformio.ini
+/CMakeListsPrivate.txt
+/CMakeLists.txt
