@@ -1,16 +1,39 @@
 #include <avr/interrupt.h>
+#include <avr/pgmspace.h>
 #include <util/delay.h>
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #include <defines.h>
 #include <spi.h>
+#include <fs.h>
+#include <block_dev.h>
 
-#include <stdio.h>
-#include <avr/pgmspace.h>
+typedef struct sd_card_s {
+    struct spi_device_s *spi_dev;
+    struct block_dev_s *bdev;
+
+    uint8_t type;   // SDSCv1, SDSCv2, SDHC/SDXC
+    struct {
+        uint8_t
+            in_block : 1,       // indicates that the device is in the process of reading a block.
+            partial_read : 1;   // partial block read
+    } flags;
+    uint32_t cur_block; // current reading block
+    uint16_t offset;    // current offset
+} sd_card_t;
+
+static inline sd_card_t *sd_get_dev(bdev_t *bdev) {
+    return (sd_card_t *)blk_get_priv(bdev);
+}
+
+static inline void sd_set_dev(bdev_t *bdev, sd_card_t *sd) {
+    blk_set_priv(bdev, sd);
+}
 
 /* Commands */
 
@@ -494,20 +517,6 @@ static void sd_print_err_msg(int8_t err) {
     putchar('\n');
 }
 
-typedef struct sd_card_s {
-    uint8_t type;   // SDSCv1, SDSCv2, SDHC/SDXC
-    uint16_t blk_size;  // size of block (512 bytes by default)
-    uint32_t blk_num;   // number of blocks
-
-    struct {
-        uint8_t
-            in_block : 1,       // indicates that the device is in the process of reading a block.
-            partial_read : 1;   // partial block read
-    } flags;
-    uint32_t cur_block; // current reading block
-    uint16_t offset;    // current offset
-} sd_card_t;
-
 /*!
  * @param type SD Card type
  */
@@ -586,12 +595,11 @@ static int8_t sd_wait_not_busy(void) {
 
 /*!
  * @brief Send command to SD card
- * @param card SD card on SPI
  * @param cmd Command to send
  * @param args Arguments for command
  * @return SD_NO_ERR on success
  */
-static int8_t sd_cmd_send(spi_dev_t *card, uint8_t cmd, uint32_t args) {
+static int8_t sd_cmd_send(uint8_t cmd, uint32_t args) {
     struct cmd_token ct;
 
     if (sd_wait_not_busy()) {
@@ -656,32 +664,33 @@ static int8_t sd_wait_data_token(uint8_t token) {
  * @brief Determine block size and number of blocks.
  * Store this data to private structure.
  */
-static int8_t sd_get_card_size(spi_dev_t *card) {
-    sd_card_t *sd = card->priv_data;
+static int8_t sd_get_card_size(sd_card_t *sd) {
+    bdev_t *bdev = sd->bdev;
+    struct avr_pin_s *cs = &sd->spi_dev->cs;
     int8_t err;
     csd_t csd;
     uint32_t c_size;
 
-    chip_select(card->cs);
-    err = sd_cmd_send(card, SEND_CSD, 0);
+    chip_select(cs);
+    err = sd_cmd_send(SEND_CSD, 0);
     if (err != SD_NO_ERR) {
-        chip_desel(card->cs);
+        chip_desel(cs);
         return err;
     }
 
     if (sd_read_r1() != R1_READY_STATE) {
         // Error state. exit
-        chip_desel(card->cs);
+        chip_desel(cs);
         return SD_ERR_STATE;
     }
 
     err = sd_wait_data_token(SINGLE_START_BLOCK);
     if (err) {
-        chip_desel(card->cs);
+        chip_desel(cs);
         return err;
     }
     spi_read_buf((void *)&csd, sizeof(csd));
-    chip_desel(card->cs);
+    chip_desel(cs);
 
     if (csd.csd_ver == SD_CSD_V1) {
         uint8_t c_size_mult;
@@ -692,304 +701,34 @@ static int8_t sd_get_card_size(spi_dev_t *card) {
         c_size_mult = ((csd.v1.c_size_mult_high << 1) |
                        csd.v1.c_size_mult_low);
         c_size = (c_size + 1) << (c_size_mult + csd.v1.read_bl_len - 7);
-        sd->blk_size = 1 << csd.v1.read_bl_len;
+        bdev->bd_blk_size = 1 << csd.v1.read_bl_len;
     } else if (csd.csd_ver == SD_CSD_V2) {
         c_size = (((uint32_t)csd.v2.c_size_high << 16) |
                   (csd.v2.c_size_mid << 8) |
                   csd.v2.c_size_low);
         c_size = (c_size + 1) << 10;
-        sd->blk_size = 512;
+        bdev->bd_blk_size = 512;
     } else {
         return SD_ERR_BAD_CSD;
     }
 
-    sd->blk_num = c_size;
+    bdev->bd_blk_num = c_size;
 
     return SD_NO_ERR;
-}
-
-/*!
- * @brief SD card initialization routine
- * @param card SD card on SPI device
- * @return 0 on success
- */
-int8_t sd_init(spi_dev_t *card) {
-    uint8_t sreg = SREG;
-    int8_t err = SD_ERR_BUSY;
-    uint8_t r1;
-    sd_card_t *sd;
-
-    cli();
-    _delay_ms(1);
-    spi_set_speed(25000000);
-
-    printf_P(PSTR("\nInitialize SD card... "));
-
-    // send a minimum of 74 clocks with CS and MOSI is high.
-    chip_desel(card->cs);
-    for (uint8_t i = 0; i < 10; i++)
-        spi_write(0xFF);
-
-    for (uint8_t try = 0; try < 3; try++) {
-        // turn to idle state
-        chip_select(card->cs);
-        if (sd_cmd_send(card, GO_IDLE_STATE, 0) != SD_NO_ERR) {
-            chip_desel(card->cs);
-            err = SD_ERR_BUSY;
-            continue;   // busy
-        }
-
-        // wait for response
-        r1 = sd_read_r1();
-        chip_desel(card->cs);
-        if (r1 == R1_IDLE_STATE) {
-            err = SD_NO_ERR;
-            break;
-        }
-        err = SD_ERR_READ_R1;
-    }
-    if (err != SD_NO_ERR)
-        // SD card is not set or busy
-        goto out;
-
-    sd = malloc(sizeof(sd_card_t));
-    if (!sd) {
-        // ENOMEM
-        err = SD_ERR_NOMEM;
-        goto out;
-    }
-    card->priv_data = sd;
-    sd->flags.in_block = sd->flags.partial_read = 0;
-    sd->cur_block = 0;
-    sd->offset = 0;
-
-    // send host controller voltage and check pattern
-    chip_select(card->cs);
-    err = sd_cmd_send(card, SEND_IF_COND,
-                      sd_get_cmd8_arg(VHS_3V3, CHECK_PATTERN));
-    if (err != SD_NO_ERR) {
-        // SD card is not set or busy
-        chip_desel(card->cs);
-        goto error;
-    }
-
-    r1 = sd_read_r1();
-
-    if (r1 == R1_IDLE_STATE) {
-        struct response_r7 r7;
-
-        spi_read_buf((void *)&r7, sizeof(r7));
-        chip_desel(card->cs);
-
-        if ((r7.voltage_accepted != VHS_3V3) ||
-            (r7.check_pattern != CHECK_PATTERN)) {
-            // Error state. Exit
-            err = SD_ERR_VHS;
-            goto error;
-        }
-        // ver 2.00 or later SD Memory Card
-        sd->type = SD_TYPE_SC2;
-    } else {
-        chip_desel(card->cs);
-        if (r1 & R1_ILLEGAL_CMD) {
-            // ver 1.X SD Memory Card (e.g. SDSC) or not SD Memory Card
-            sd->type = SD_TYPE_SC1;
-        } else if (r1 & R1_CRC_ERR) {
-            // CRC error
-            err = SD_ERR_CRC;
-            goto error;
-        } else {
-            // Error state. Exit
-            err = SD_ERR_IF_SEND;
-            goto error;
-        }
-    }
-
-    // check voltage range
-    chip_select(card->cs);
-    err = sd_cmd_send(card, READ_OCR, 0);
-    if (err != SD_NO_ERR) {
-        // SD card is not set or busy
-        chip_desel(card->cs);
-        goto error;
-    }
-
-    r1 = sd_read_r1();
-
-    if (r1 == R1_IDLE_STATE) {
-        struct response_r3 r3;
-
-        spi_read_buf((void *)&r3, sizeof(r3));
-        chip_desel(card->cs);
-
-        // check 3.3v support
-        if (!(r3.v_3v1_3v2 || r3.v_3v2_3v3)) {
-            err = SD_ERR_VNOTSUPPORT;
-            goto error;
-        }
-    } else {
-        chip_desel(card->cs);
-        err = SD_ERR_UNUSABLE;
-        goto error;
-    }
-
-    // Start of initialization
-    while (true) {
-        uint8_t flag = false;
-        // prepare to send app cmd
-        while (!flag) {
-            chip_select(card->cs);
-            err = sd_cmd_send(card, APP_CMD, 0);
-            if (err != SD_NO_ERR) {
-                // SD card is not set or busy
-                chip_desel(card->cs);
-                goto error;
-            }
-
-            r1 = sd_read_r1();
-            chip_desel(card->cs);
-
-            if (r1 == R1_IDLE_STATE)
-                break;
-        }
-
-        // init
-        chip_select(card->cs);
-        err = sd_cmd_send(card, flag ? SEND_OP_COND : SD_SEND_OP_COND,
-                          sd_get_cmd1_acmd41_arg(sd->type));
-        if (err != SD_NO_ERR) {
-            // SD card is not set or busy
-            chip_desel(card->cs);
-            goto error;
-        }
-
-        r1 = sd_read_r1();
-        chip_desel(card->cs);
-
-        if (r1 & R1_ILLEGAL_CMD) {
-            if (sd->type == SD_TYPE_SC1) {
-                if (!flag) {
-                    flag = true;
-                    continue;
-                }
-            }
-            // Error State. Exit
-            err = SD_ERR_ILLEGAL_CMD;
-            goto error;
-        } else if (r1 == R1_READY_STATE) {
-            // Initialization is complete
-            break;
-        } else if (r1 != R1_IDLE_STATE) {
-            // Error State. Exit
-            err = SD_ERR_STATE;
-            goto error;
-        }
-        // else card is still initializing. retry.
-    }
-
-    if (sd->type != SD_TYPE_SC1) {
-        // check CCS (Card Capacity Status)
-        chip_select(card->cs);
-        err = sd_cmd_send(card, READ_OCR, 0);
-        if (err != SD_NO_ERR) {
-            // SD card is not set or busy
-            chip_desel(card->cs);
-            goto error;
-        }
-
-        r1 = sd_read_r1();
-
-        if (r1 == R1_READY_STATE) {
-            struct response_r3 r3;
-
-            spi_read_buf((void *)&r3, sizeof(r3));
-            chip_desel(card->cs);
-
-            if (!r3.busy) {
-                // card still in init state. this error?
-                err = SD_ERR_STATE;
-                goto error;
-            }
-            if (r3.ccs) {
-                // is SDHC/SDXC
-                sd->type = SD_TYPE_HC;
-                // init success
-            } else {
-                // is SDSCv2
-                sd->type = SD_TYPE_SC2;
-                chip_select(card->cs);
-                err = sd_cmd_send(card, SET_BLOCKLEN, 512);
-                if (err != SD_NO_ERR) {
-                    // SD card is not set or busy
-                    chip_desel(card->cs);
-                    goto error;
-                }
-
-                r1 = sd_read_r1();
-                chip_desel(card->cs);
-                if (r1 != R1_READY_STATE) {
-                    // error state. exit
-                    err = SD_ERR_READ_R1;
-                    goto error;
-                }
-                // init success
-            }
-        } else {
-            chip_desel(card->cs);
-            err = SD_ERR_READ_R1;
-            goto error;
-        }
-    }
-
-    // Set block length to 512 bytes
-    if ((sd->type == SD_TYPE_SC1) ||
-        (sd->type == SD_TYPE_SC2)) {
-        chip_select(card->cs);
-        err = sd_cmd_send(card, SET_BLOCKLEN, 512);
-        if (err != SD_NO_ERR) {
-            // SD card is not set or busy
-            chip_desel(card->cs);
-            goto error;
-        }
-
-        r1 = sd_read_r1();
-        chip_desel(card->cs);
-        if (r1 != R1_READY_STATE) {
-            // Error state. exit
-            err = SD_ERR_READ_R1;
-            goto error;
-        }
-        // success
-    }
-
-    err = sd_get_card_size(card);
-    if (err)
-        goto error;
-
-out:
-    chip_desel(card->cs);
-    SREG = sreg;
-
-    sd_print_err_msg(err);
-
-    return err;
-error:
-    free(sd);
-    card->priv_data = NULL;
-    goto out;
 }
 
 /*!
  * @brief Get and print CID register
  */
 int8_t sd_get_cid(spi_dev_t *card) {
+    struct avr_pin_s *cs = &card->cs;
     int8_t err = SD_NO_ERR;
     cid_t cid;
     char oid[3] = {0};
     char pnm[6] = {0};
 
-    chip_select(card->cs);
-    err = sd_cmd_send(card, SEND_CID, 0);
+    chip_select(cs);
+    err = sd_cmd_send(SEND_CID, 0);
     if (err != SD_NO_ERR)
         goto out;
 
@@ -1004,7 +743,7 @@ int8_t sd_get_cid(spi_dev_t *card) {
         goto out;
 
     spi_read_buf((void *)&cid, sizeof(cid));
-    chip_desel(card->cs);
+    chip_desel(cs);
 
     memcpy(oid, cid.oid, 2);
     memcpy(pnm, cid.pnm, 5);
@@ -1015,12 +754,13 @@ int8_t sd_get_cid(spi_dev_t *card) {
     printf_P(PSTR("Manufacturing date: %u/%u\n"), cid.mdt_month, ((cid.mdt_year_high << 4) | cid.mdt_year_low) + 2000);
 
 out:
-    chip_desel(card->cs);
+    chip_desel(cs);
     return err;
 }
 
 void sd_get_card_info(spi_dev_t *card) {
-    sd_card_t *sd = card->priv_data;
+    bdev_t *bdev = blk_get_dev(card);
+    sd_card_t *sd = sd_get_dev(bdev);
 
     printf_P(PSTR("Type:       "));
     switch (sd->type) {
@@ -1039,23 +779,23 @@ void sd_get_card_info(spi_dev_t *card) {
     }
     putchar('\n');
 
-    printf_P(PSTR("Blocks:     %lu\n"), sd->blk_num);
-    printf_P(PSTR("Block size: %u bytes\n"), sd->blk_size); // always 512
-    float size_gb = (double)((uint64_t)sd->blk_num << 9) / 1073741824.0;
+    printf_P(PSTR("Blocks:     %lu\n"), bdev->bd_blk_num);
+    printf_P(PSTR("Block size: %u bytes\n"), bdev->bd_blk_size);    // always 512
+    float size_gb = (double)((uint64_t)bdev->bd_blk_num << 9) / 1073741824.0;
     uint16_t rest_mb = (size_gb - (float)((uint16_t)size_gb)) * 1000.0f;
     printf_P(PSTR("Total Size: %u.%03u GiB\n"), (uint16_t)size_gb, rest_mb);
 }
 
-/** TODO: sd_read_end
-static int8_t sd_read_end(spi_dev_t *card) {
-    sd_card_t *sd = card->priv_data;
+/** TODO: sd_read_end 
+static int8_t sd_read_end(bdev_t *sd_bdev) {
+    sd_card_t *sd = sd_get_dev(sd_bdev);
     int8_t err = SD_NO_ERR;
     uint8_t r1;
 
     if (sd->flags.in_block) {
         sd->flags.in_block = 0;
 
-        err = sd_cmd_send(card, STOP_TRANSMISSION, 0);
+        err = sd_cmd_send(STOP_TRANSMISSION, 0);
         if (err != SD_NO_ERR)
             goto out;
 
@@ -1068,31 +808,31 @@ static int8_t sd_read_end(spi_dev_t *card) {
 out:
     return err;
 }
-*/
+// */
 
 /*!
  * @brief Read data from SD card
- * @param card SD card on SPI
+ * @param sd_bdev SD card block device
  * @param block Logical block to be read
  * @param dst Pointer to buffer to store data
  * @param offset Offset from start of block in bytes
  * @param cnt Number of bytes to read; 512 max
  * @return 0 on success
  */
-int8_t sd_read_data(spi_dev_t *card, uint32_t block, uint8_t *dst,
+static int8_t sd_read_data(bdev_t *sd_bdev, uint32_t block, uint8_t *dst,
                     uint16_t offset, uint16_t cnt) {
-    sd_card_t *sd = card->priv_data;
+    sd_card_t *sd = sd_get_dev(sd_bdev);
     int8_t err = SD_NO_ERR;
 
     if (cnt == 0)
-        return SD_NO_ERR;
+        return err;
 
     if ((offset + cnt) > 512) {
         // EINVAL - invalid arguments
         return 22;
     }
 
-    chip_select(card->cs);
+    chip_select(&sd->spi_dev->cs);
 
     if (!sd->flags.in_block || sd->cur_block != block || sd->offset > offset) {
         sd->cur_block = block;
@@ -1101,7 +841,7 @@ int8_t sd_read_data(spi_dev_t *card, uint32_t block, uint8_t *dst,
             // SDSC used byte address
             block <<= 9;
 
-        err = sd_cmd_send(card, READ_SINGLE_BLOCK, block);
+        err = sd_cmd_send(READ_SINGLE_BLOCK, block);
         if (err != SD_NO_ERR)
             goto out;
 
@@ -1137,31 +877,31 @@ int8_t sd_read_data(spi_dev_t *card, uint32_t block, uint8_t *dst,
     }
 
 out:
-    chip_desel(card->cs);
+    chip_desel(&sd->spi_dev->cs);
 
     return err;
 }
 
 /*!
  * @brief Read a one 512 bytes block from SD card
- * @param card SD card on SPI
+ * @param sd_bdev SD card block device
  * @param block Logical block to be read
  * @param dst Pointer to buffer to store data
  * @return 0 on success
  */
-int8_t sd_read_block(spi_dev_t *card, uint32_t block, uint8_t *dst) {
-    return sd_read_data(card, block, dst, 0, 512);
+static int8_t sd_read_block(bdev_t *sd_bdev, uint32_t block, uint8_t *dst) {
+    return sd_read_data(sd_bdev, block, dst, 0, 512);
 }
 
 /*!
  * @brief Write a one 512 bytes block to SD card
- * @param card SD card on SPI
+ * @param sd_bdev SD card block device
  * @param block Logical block to be write
  * @param src Pointer to buffer of data to be write
  * @return 0 on success
  */
-int8_t sd_write_block(spi_dev_t *card, uint32_t block, const uint8_t *src) {
-    sd_card_t *sd = card->priv_data;
+static int8_t sd_write_block(bdev_t *sd_bdev, uint32_t block, const uint8_t *src) {
+    sd_card_t *sd = sd_get_dev(sd_bdev);
     int8_t err = SD_NO_ERR;
     uint8_t response;
 
@@ -1169,9 +909,9 @@ int8_t sd_write_block(spi_dev_t *card, uint32_t block, const uint8_t *src) {
         // SDSC used byte address
         block <<= 9;
 
-    chip_select(card->cs);
+    chip_select(&sd->spi_dev->cs);
 
-    err = sd_cmd_send(card, WRITE_BLOCK, block);
+    err = sd_cmd_send(WRITE_BLOCK, block);
     if (err != SD_NO_ERR)
         goto out;
 
@@ -1202,7 +942,320 @@ int8_t sd_write_block(spi_dev_t *card, uint32_t block, const uint8_t *src) {
         err = SD_ERR_BUSY;
 
 out:
-    chip_desel(card->cs);
+    chip_desel(&sd->spi_dev->cs);
 
     return err;
+}
+
+static int8_t sd_request(struct request_s *req) {
+    int8_t ret = -1;
+
+    switch (req->cmd_flags) {
+        case REQ_READ:
+            ret = sd_read_block(req->bdev, req->block, req->buf);
+            break;
+
+        case REQ_WRITE:
+            ret = sd_write_block(req->bdev, req->block, req->buf);
+            break;
+
+        default:
+            break;
+    }
+
+    return ret;
+}
+
+static const struct blk_dev_ops_s sd_bdev_ops PROGMEM = {
+    // .open = NULL,
+    // .release = NULL,
+    .request = sd_request,
+};
+
+/*!
+ * @brief SD card initialization routine
+ * @param card SD card on SPI device
+ * @return 0 on success
+ */
+int8_t sd_init(spi_dev_t *card) {
+    uint8_t sreg = SREG;
+    int8_t err = SD_ERR_BUSY;
+    uint8_t r1;
+    bdev_t *bdev;
+    sd_card_t *sd;
+    struct avr_pin_s *cs = &card->cs;
+
+    cli();
+    _delay_ms(1);
+    spi_set_speed(25000000);
+
+    printf_P(PSTR("\nInitialize SD card... "));
+
+    // send a minimum of 74 clocks with CS and MOSI is high.
+    chip_desel(cs);
+    for (uint8_t i = 0; i < 10; i++)
+        spi_write(0xFF);
+
+    for (uint8_t try = 0; try < 3; try++) {
+        // turn to idle state
+        chip_select(cs);
+        if (sd_cmd_send(GO_IDLE_STATE, 0) != SD_NO_ERR) {
+            chip_desel(cs);
+            err = SD_ERR_BUSY;
+            continue;   // busy
+        }
+
+        // wait for response
+        r1 = sd_read_r1();
+        chip_desel(cs);
+        if (r1 == R1_IDLE_STATE) {
+            err = SD_NO_ERR;
+            break;
+        }
+        err = SD_ERR_READ_R1;
+    }
+    if (err != SD_NO_ERR)
+        // SD card is not set or busy
+        goto out;
+
+    bdev = malloc(sizeof(bdev_t));
+    if (!bdev) {
+        // ENOMEM
+        err = SD_ERR_NOMEM;
+        goto out;
+    }
+
+    sd = malloc(sizeof(sd_card_t));
+    if (!sd) {
+        // ENOMEM
+        free(bdev);
+        err = SD_ERR_NOMEM;
+        goto out;
+    }
+    blk_set_dev(card, bdev);
+    sd_set_dev(bdev, sd);
+    bdev->blk_ops = &sd_bdev_ops;
+
+    sd->spi_dev = card;
+    sd->bdev = bdev;
+    sd->flags.in_block = sd->flags.partial_read = 0;
+    sd->cur_block = 0;
+    sd->offset = 0;
+
+    // send host controller voltage and check pattern
+    chip_select(cs);
+    err = sd_cmd_send(SEND_IF_COND, sd_get_cmd8_arg(VHS_3V3, CHECK_PATTERN));
+    if (err != SD_NO_ERR) {
+        // SD card is not set or busy
+        chip_desel(cs);
+        goto error;
+    }
+
+    r1 = sd_read_r1();
+
+    if (r1 == R1_IDLE_STATE) {
+        struct response_r7 r7;
+
+        spi_read_buf((void *)&r7, sizeof(r7));
+        chip_desel(cs);
+
+        if ((r7.voltage_accepted != VHS_3V3) ||
+            (r7.check_pattern != CHECK_PATTERN)) {
+            // Error state. Exit
+            err = SD_ERR_VHS;
+            goto error;
+        }
+        // ver 2.00 or later SD Memory Card
+        sd->type = SD_TYPE_SC2;
+    } else {
+        chip_desel(cs);
+        if (r1 & R1_ILLEGAL_CMD) {
+            // ver 1.X SD Memory Card (e.g. SDSC) or not SD Memory Card
+            sd->type = SD_TYPE_SC1;
+        } else if (r1 & R1_CRC_ERR) {
+            // CRC error
+            err = SD_ERR_CRC;
+            goto error;
+        } else {
+            // Error state. Exit
+            err = SD_ERR_IF_SEND;
+            goto error;
+        }
+    }
+
+    // check voltage range
+    chip_select(cs);
+    err = sd_cmd_send(READ_OCR, 0);
+    if (err != SD_NO_ERR) {
+        // SD card is not set or busy
+        chip_desel(cs);
+        goto error;
+    }
+
+    r1 = sd_read_r1();
+
+    if (r1 == R1_IDLE_STATE) {
+        struct response_r3 r3;
+
+        spi_read_buf((void *)&r3, sizeof(r3));
+        chip_desel(cs);
+
+        // check 3.3v support
+        if (!(r3.v_3v1_3v2 || r3.v_3v2_3v3)) {
+            err = SD_ERR_VNOTSUPPORT;
+            goto error;
+        }
+    } else {
+        chip_desel(cs);
+        err = SD_ERR_UNUSABLE;
+        goto error;
+    }
+
+    // Start of initialization
+    while (true) {
+        uint8_t flag = false;
+        // prepare to send app cmd
+        while (!flag) {
+            chip_select(cs);
+            err = sd_cmd_send(APP_CMD, 0);
+            if (err != SD_NO_ERR) {
+                // SD card is not set or busy
+                chip_desel(cs);
+                goto error;
+            }
+
+            r1 = sd_read_r1();
+            chip_desel(cs);
+
+            if (r1 == R1_IDLE_STATE)
+                break;
+        }
+
+        // init
+        chip_select(cs);
+        err = sd_cmd_send(flag ? SEND_OP_COND : SD_SEND_OP_COND,
+                          sd_get_cmd1_acmd41_arg(sd->type));
+        if (err != SD_NO_ERR) {
+            // SD card is not set or busy
+            chip_desel(cs);
+            goto error;
+        }
+
+        r1 = sd_read_r1();
+        chip_desel(cs);
+
+        if (r1 & R1_ILLEGAL_CMD) {
+            if (sd->type == SD_TYPE_SC1) {
+                if (!flag) {
+                    flag = true;
+                    continue;
+                }
+            }
+            // Error State. Exit
+            err = SD_ERR_ILLEGAL_CMD;
+            goto error;
+        } else if (r1 == R1_READY_STATE) {
+            // Initialization is complete
+            break;
+        } else if (r1 != R1_IDLE_STATE) {
+            // Error State. Exit
+            err = SD_ERR_STATE;
+            goto error;
+        }
+        // else card is still initializing. retry.
+    }
+
+    if (sd->type != SD_TYPE_SC1) {
+        // check CCS (Card Capacity Status)
+        chip_select(cs);
+        err = sd_cmd_send(READ_OCR, 0);
+        if (err != SD_NO_ERR) {
+            // SD card is not set or busy
+            chip_desel(cs);
+            goto error;
+        }
+
+        r1 = sd_read_r1();
+
+        if (r1 == R1_READY_STATE) {
+            struct response_r3 r3;
+
+            spi_read_buf((void *)&r3, sizeof(r3));
+            chip_desel(cs);
+
+            if (!r3.busy) {
+                // card still in init state. this error?
+                err = SD_ERR_STATE;
+                goto error;
+            }
+            if (r3.ccs) {
+                // is SDHC/SDXC
+                sd->type = SD_TYPE_HC;
+                // init success
+            } else {
+                // is SDSCv2
+                sd->type = SD_TYPE_SC2;
+                chip_select(cs);
+                err = sd_cmd_send(SET_BLOCKLEN, 512);
+                if (err != SD_NO_ERR) {
+                    // SD card is not set or busy
+                    chip_desel(cs);
+                    goto error;
+                }
+
+                r1 = sd_read_r1();
+                chip_desel(cs);
+                if (r1 != R1_READY_STATE) {
+                    // error state. exit
+                    err = SD_ERR_READ_R1;
+                    goto error;
+                }
+                // init success
+            }
+        } else {
+            chip_desel(cs);
+            err = SD_ERR_READ_R1;
+            goto error;
+        }
+    }
+
+    // Set block length to 512 bytes
+    if ((sd->type == SD_TYPE_SC1) ||
+        (sd->type == SD_TYPE_SC2)) {
+        chip_select(cs);
+        err = sd_cmd_send(SET_BLOCKLEN, 512);
+        if (err != SD_NO_ERR) {
+            // SD card is not set or busy
+            chip_desel(cs);
+            goto error;
+        }
+
+        r1 = sd_read_r1();
+        chip_desel(cs);
+        if (r1 != R1_READY_STATE) {
+            // Error state. exit
+            err = SD_ERR_READ_R1;
+            goto error;
+        }
+        // success
+    }
+
+    err = sd_get_card_size(sd);
+    if (err)
+        goto error;
+
+out:
+    chip_desel(cs);
+    SREG = sreg;
+
+    sd_print_err_msg(err);
+
+    return err;
+error:
+    sd_set_dev(bdev, NULL);
+    free(bdev);
+    sd->bdev = NULL;
+    free(sd);
+    blk_set_dev(card, NULL);
+    goto out;
 }

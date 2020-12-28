@@ -1,6 +1,6 @@
 {
     "name": "SD",
-    "version": "0.0.1",
+    "version": "0.1.0",
     "description": "Library containing the SD card driver to communicate over an SPI bus.",
     "keywords": "avr, baskiton, sd",
     "repository":
@@ -21,6 +21,7 @@
     "platforms": ["atmelavr"],
     "dependencies": {
         "defines-avr": "^1.2.1",
-        "spi-avr": "^1.5.0"
+        "spi-avr": "^1.6.0",
+        "fs-avr": "^0.0.1"
     }
 }
